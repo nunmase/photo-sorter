@@ -1,48 +1,12 @@
-import errno
 import os
 import shutil
-import stat
-from tempfile import TemporaryDirectory
+import threading
+import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel
-from PIL import Image, ImageTk, ExifTags
+from PIL import Image, ImageTk
 import json
 import sys
-import datetime
-
-
-def move_without_overwrite(source_path, destination_path):
-    """Move a photo while preserving any file at the destination."""
-    if os.path.lexists(destination_path):
-        raise FileExistsError(f"같은 이름의 파일 또는 폴더가 있습니다.\n{destination_path}")
-
-    # Windows의 같은 드라이브 안에서는 기존 파일을 덮어쓰지 않는 이름 변경을 사용한다.
-    if os.name == 'nt':
-        try:
-            os.rename(source_path, destination_path)
-            return
-        except OSError as error:
-            if error.errno != errno.EXDEV:
-                raise
-
-    # 복사가 끝난 파일만 최종 이름으로 옮기고, 기존 파일이 생겼으면 중단한다.
-    destination_folder = os.path.dirname(destination_path) or '.'
-    with TemporaryDirectory(dir=destination_folder) as temporary_folder:
-        staged_path = os.path.join(temporary_folder, 'photo')
-        shutil.copy2(source_path, staged_path, follow_symlinks=False)
-        if os.name == 'nt':
-            os.rename(staged_path, destination_path)
-        else:
-            os.link(staged_path, destination_path, follow_symlinks=False)
-
-        try:
-            os.unlink(source_path)
-        except OSError:
-            if os.name == 'nt' and not os.path.islink(destination_path):
-                os.chmod(destination_path, stat.S_IWRITE)
-            os.unlink(destination_path)
-            raise
-
 
 class PhotoSorterApp:
     def __init__(self, root):
@@ -57,9 +21,11 @@ class PhotoSorterApp:
 
         self.is_sorting_mode = False
 
-        self.resize_job = None  # resize_job 초기화
+        self.event_queue = queue.Queue()  # 이벤트 큐 생성
+        self.event_thread = threading.Thread(target=self.process_events, daemon=True)
+        self.event_thread.start()
 
-        self.move_history = []  # 이동 기록을 저장할 스택
+        self.resize_job = None  # resize_job 초기화
 
         # 단축키 관련 변수 초기화
         self.shortcuts = {
@@ -67,16 +33,14 @@ class PhotoSorterApp:
             'select_all_destination_folders': None,
             'select_specific_destination_folders': None,
             'set_shortcuts': None,
-            'toggle_sorting_mode': None,
-            'undo_move': None  # 실행 취소 단축키 추가
+            'toggle_sorting_mode': None
         }
         self.function_map = {
             'select_source_folder': self.select_source_folder,
             'select_all_destination_folders': self.select_all_destination_folders,
             'select_specific_destination_folders': self.select_specific_destination_folders,
             'set_shortcuts': self.set_shortcuts,
-            'toggle_sorting_mode': self.toggle_sorting_mode,
-            'undo_move': self.undo_move  # 실행 취소 함수 매핑
+            'toggle_sorting_mode': self.toggle_sorting_mode
         }
         self.shortcut_key_labels = {}  # 단축키 레이블 저장
 
@@ -85,9 +49,7 @@ class PhotoSorterApp:
             '파일 이름 오름차순',
             '파일 이름 내림차순',
             '수정 날짜 오름차순',
-            '수정 날짜 내림차순',
-            '촬영 날짜 오름차순',    # 추가
-            '촬영 날짜 내림차순'     # 추가
+            '수정 날짜 내림차순'
         ]
         self.selected_sort_option = tk.StringVar()
         self.selected_sort_option.set(self.sort_options[0])  # 기본값 설정
@@ -143,15 +105,7 @@ class PhotoSorterApp:
             with open(settings_path, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
                 self.source_folder = settings.get('source_folder', '')
-                # 원본 폴더 존재 여부 확인
-                if not os.path.exists(self.source_folder):
-                    self.source_folder = ''
-
-                # 분류 폴더 로드 시 키를 정수로 변환
-                self.destination_folders = {int(k): v for k, v in settings.get('destination_folders', {}).items()}
-                # 분류 폴더 존재 여부 확인
-                self.destination_folders = {k: v for k, v in self.destination_folders.items() if os.path.exists(v)}
-
+                self.destination_folders = settings.get('destination_folders', {})
                 self.shortcuts = settings.get('shortcuts', {})
                 selected_sort_option = settings.get('selected_sort_option', self.sort_options[0])
                 self.selected_sort_option.set(selected_sort_option)
@@ -176,7 +130,6 @@ class PhotoSorterApp:
         tk.Button(self.button_frame, text="단축키 설정", command=self.set_shortcuts).pack(side=tk.LEFT, padx=5)
         self.sort_button = tk.Button(self.button_frame, text="분류 시작", command=self.toggle_sorting_mode)
         self.sort_button.pack(side=tk.LEFT, padx=5)
-        tk.Button(self.button_frame, text="실행 취소", command=self.undo_move).pack(side=tk.LEFT, padx=5)  # 실행 취소 버튼 추가
 
         # 정렬 옵션 드롭다운 메뉴 추가
         tk.Label(self.button_frame, text="정렬 기준:").pack(side=tk.LEFT, padx=5)
@@ -184,7 +137,7 @@ class PhotoSorterApp:
         self.sort_option_menu.pack(side=tk.LEFT, padx=5)
 
         # 원본 폴더 및 분류 폴더 정보를 표시하는 레이블을 버튼 프레임에 추가
-        self.info_label = tk.Label(self.button_frame, text="원본 폴더: 없음 / 선택된 분류 폴더: 0개")
+        self.info_label = tk.Label(self.button_frame, text="원본 폴더: 없음 / 분류 폴더: 0")
         self.info_label.pack(side=tk.LEFT, padx=5)
 
         # 이미지 표시를 위한 프레임과 레이블
@@ -203,7 +156,7 @@ class PhotoSorterApp:
     def update_labels(self):
         source_text = f"원본 폴더: {self.source_folder if self.source_folder else '없음'}"
         dest_count = len(self.destination_folders)
-        dest_text = f"선택된 분류 폴더: {dest_count}개"
+        dest_text = f"분류 폴더: {dest_count}"
         self.info_label.config(text=f"{source_text} / {dest_text}")
 
     def select_source_folder(self):
@@ -235,10 +188,6 @@ class PhotoSorterApp:
             self.photo_list = sorted(photo_files, key=lambda x: os.path.getmtime(os.path.join(self.source_folder, x)))
         elif sort_option == '수정 날짜 내림차순':
             self.photo_list = sorted(photo_files, key=lambda x: os.path.getmtime(os.path.join(self.source_folder, x)), reverse=True)
-        elif sort_option == '촬영 날짜 오름차순':
-            self.photo_list = sorted(photo_files, key=lambda x: self.get_taken_date_safe(os.path.join(self.source_folder, x)) or datetime.datetime.min)
-        elif sort_option == '촬영 날짜 내림차순':
-            self.photo_list = sorted(photo_files, key=lambda x: self.get_taken_date_safe(os.path.join(self.source_folder, x)) or datetime.datetime.min, reverse=True)
         else:
             self.photo_list = photo_files  # 기본값
 
@@ -248,16 +197,6 @@ class PhotoSorterApp:
             self.display_photo()
         else:
             messagebox.showinfo("사진이 없습니다", "선택한 원본 폴더에 사진이 없습니다.")
-
-    def get_taken_date_safe(self, photo_path):
-        date_str = get_taken_date(photo_path)
-        if date_str:
-            try:
-                # 날짜 문자열을 datetime 객체로 변환
-                return datetime.datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
-            except ValueError as e:
-                print(f"날짜 형식 변환 오류 ({photo_path}): {e}")
-        return None
 
     def display_photo(self):
         if self.photo_list and 0 <= self.current_photo_index < len(self.photo_list):
@@ -307,7 +246,6 @@ class PhotoSorterApp:
                     self.photo_image = None
                     messagebox.showerror("오류", "유효한 이미지 파일을 찾을 수 없습니다.")
                     self.is_sorting_mode = False
-                    self.update_sort_button()  # 버튼 UI 업데이트
                     return
                 else:
                     self.display_photo()
@@ -335,33 +273,16 @@ class PhotoSorterApp:
     def select_specific_destination_folders(self):
         popup = Toplevel(self.root)
         popup.title("분류 폴더 선택")
-        popup.geometry("500x500")  # 높이를 증가시킴
+        popup.geometry("500x400")  # 가로 크기를 500으로 증가
         popup.transient(self.root)
         popup.grab_set()
         popup.focus_set()
         popup.bind("<Escape>", lambda e: popup.destroy())  # ESC 키로 창 닫기
 
-        folder_labels = []  # 폴더 레이블들을 저장할 리스트
-
         for i in range(1, 10):
             folder_label = tk.Label(popup, text=f"분류 폴더 {i}: {self.destination_folders.get(i, '선택되지 않음')}")
             folder_label.grid(row=i-1, column=0, padx=5, pady=5)
-            folder_labels.append(folder_label)  # 레이블 저장
             tk.Button(popup, text=f"폴더 {i} 선택", command=lambda i=i, label=folder_label: self.update_specific_folder(i, label)).grid(row=i-1, column=1, padx=5, pady=5)
-
-        # 분류 폴더 초기화 버튼 추가
-        reset_button = tk.Button(popup, text="분류 폴더 초기화", command=lambda: self.reset_destination_folders(folder_labels))
-        reset_button.grid(row=10, column=0, columnspan=2, padx=5, pady=20)  # 버튼을 아래쪽에 위치시킴
-
-    def reset_destination_folders(self, folder_labels):
-        result = messagebox.askquestion("분류 폴더 초기화", "모든 분류 폴더를 초기화하시겠습니까?", icon='warning')
-        if result == 'yes':
-            self.destination_folders.clear()
-            # 폴더 레이블 업데이트
-            for i, label in enumerate(folder_labels, start=1):
-                label.config(text=f"분류 폴더 {i}: 선택되지 않음")
-            self.update_labels()  # 메인 윈도우의 레이블 업데이트
-            self.save_settings()  # 설정 저장
 
     def update_specific_folder(self, folder_number, folder_label):
         folder = filedialog.askdirectory(title=f"분류 폴더 {folder_number} 선택")
@@ -379,86 +300,72 @@ class PhotoSorterApp:
             return
 
         self.is_sorting_mode = not self.is_sorting_mode
-        self.update_sort_button()  # 버튼 UI 업데이트
 
         if self.is_sorting_mode:
+            self.sort_button.config(bg="red", text="분류 중지")
             if self.photo_list:
                 self.display_photo()
             else:
                 messagebox.showinfo("사진이 없습니다", "더 이상 분류할 사진이 없습니다.")
                 self.is_sorting_mode = False
-                self.update_sort_button()  # 버튼 UI 업데이트
-
-    def update_sort_button(self):
-        if self.is_sorting_mode:
-            self.sort_button.config(bg="red", text="분류 중지")
         else:
             self.sort_button.config(bg="SystemButtonFace", text="분류 시작")
 
     def handle_keypress(self, event):
-        if self.is_sorting_mode and event.char.isdecimal():
+        if self.is_sorting_mode and event.char.isdigit():
             folder_number = int(event.char)
             if folder_number in self.destination_folders:
-                self.move_photo(folder_number)
+                # 이벤트 큐에 키 입력 추가
+                self.event_queue.put(folder_number)
+
+    def process_events(self):
+        while True:
+            folder_number = self.event_queue.get()
+            if folder_number is None:
+                break  # 스레드 종료
+            self.move_photo(folder_number)
+            self.event_queue.task_done()
 
     def move_photo(self, folder_number):
-        if self.current_photo_index >= len(self.photo_list):
-            self.is_sorting_mode = False
-            self.update_sort_button()
-            self.display_photo()
-            messagebox.showinfo("사진이 없습니다", "더 이상 분류할 사진이 없습니다.")
-            return
-
-        photo_to_move = self.photo_list[self.current_photo_index]
-        source_path = os.path.join(self.source_folder, photo_to_move)
-        destination_path = os.path.join(self.destination_folders[folder_number], photo_to_move)
-
         try:
-            move_without_overwrite(source_path, destination_path)
-        except OSError as error:
-            messagebox.showerror("이동 오류", str(error))
-            return
+            if self.current_photo_index >= len(self.photo_list):
+                # 더 이상 사진이 없을 경우
+                self.is_sorting_mode = False
+                self.root.after(0, lambda: messagebox.showinfo("사진이 없습니다", "더 이상 분류할 사진이 없습니다."))
+                self.root.after(0, self.display_photo)
+                return
 
-        self.move_history.append((source_path, destination_path, photo_to_move))
-        del self.photo_list[self.current_photo_index]
-        finished = self.current_photo_index >= len(self.photo_list)
-        if finished:
-            self.is_sorting_mode = False
-            self.update_sort_button()
-        self.display_photo()
-        if finished:
-            messagebox.showinfo("완료", "모든 사진이 분류되었습니다.")
+            photo_to_move = self.photo_list[self.current_photo_index]
+            source_path = os.path.join(self.source_folder, photo_to_move)
+            destination_path = os.path.join(self.destination_folders[folder_number], photo_to_move)
 
-    def undo_move(self):
-        if not self.move_history:
-            messagebox.showinfo("실행 취소 불가", "실행 취소할 작업이 없습니다.")
-            return
+            shutil.move(source_path, destination_path)
 
-        source_path, destination_path, photo_name = self.move_history[-1]
+            # 이미지 이동 후 photo_list에서 해당 파일 제거
+            del self.photo_list[self.current_photo_index]
 
-        try:
-            move_without_overwrite(destination_path, source_path)
-        except OSError as error:
-            messagebox.showerror("실행 취소 오류", str(error))
-            return
+            # UI 업데이트는 메인 스레드에서 수행해야 함
+            self.root.after(0, self.display_photo)
 
-        self.move_history.pop()
-        original_folder = os.path.normcase(os.path.realpath(os.path.dirname(source_path)))
-        current_folder = os.path.normcase(os.path.realpath(self.source_folder))
-        if original_folder == current_folder and photo_name not in self.photo_list:
-            self.photo_list.insert(self.current_photo_index, photo_name)
-            self.display_photo()
+            if self.current_photo_index >= len(self.photo_list):
+                self.is_sorting_mode = False
+                self.root.after(0, lambda: messagebox.showinfo("완료", "모든 사진이 분류되었습니다."))
+                self.root.after(0, self.display_photo)
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("오류", str(e)))
 
     def on_closing(self):
         # 프로그램 종료 시 설정 저장
         self.save_settings()
+        # 프로그램 종료 시 스레드 안전하게 종료
+        self.event_queue.put(None)
         self.root.destroy()
 
     # 단축키 설정 기능 수정
     def set_shortcuts(self):
         popup = Toplevel(self.root)
         popup.title("단축키 설정")
-        popup.geometry("400x350")
+        popup.geometry("400x300")
         popup.transient(self.root)
         popup.grab_set()
         popup.focus_set()
@@ -469,8 +376,7 @@ class PhotoSorterApp:
             ('모든 분류 폴더 선택', 'select_all_destination_folders'),
             ('분류 폴더 선택', 'select_specific_destination_folders'),
             ('단축키 설정', 'set_shortcuts'),
-            ('분류 시작', 'toggle_sorting_mode'),
-            ('실행 취소', 'undo_move')  # 실행 취소 추가
+            ('분류 시작', 'toggle_sorting_mode')
         ]
 
         self.waiting_for_key = None  # 현재 단축키를 기다리는 기능
@@ -502,11 +408,6 @@ class PhotoSorterApp:
         if self.waiting_for_key:
             func_name, key_label = self.waiting_for_key
             key_sym = event.keysym
-
-            # 숫자 키(1-9)는 분류 기능 전용이므로 단축키로 사용할 수 없음
-            if key_sym in [str(n) for n in range(1, 10)]:
-                messagebox.showwarning("단축키 설정 불가", "숫자 키(1-9)는 분류 기능 전용 키로 사용할 수 없습니다.")
-                return
 
             # 이전에 동일한 키가 다른 기능에 할당되어 있는지 확인
             for fn, key in self.shortcuts.items():
@@ -544,24 +445,6 @@ class PhotoSorterApp:
         func = self.function_map.get(func_name)
         if func:
             func()
-
-def get_taken_date(photo_path):
-    try:
-        img = Image.open(photo_path)
-        exif_data = img._getexif()
-        if exif_data:
-            # EXIF 태그의 키와 이름 매핑 생성
-            exif = {
-                ExifTags.TAGS.get(k, k): v
-                for k, v in exif_data.items()
-            }
-            taken_date = exif.get('DateTimeOriginal')
-            if taken_date:
-                # 날짜 형식을 통일하기 위해 반환
-                return taken_date
-    except Exception as e:
-        print(f"EXIF 데이터 추출 오류 ({photo_path}): {e}")
-    return None
 
 if __name__ == "__main__":
     root = tk.Tk()
