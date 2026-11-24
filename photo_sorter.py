@@ -4,9 +4,10 @@ import threading
 import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ExifTags
 import json
 import sys
+import datetime
 
 class PhotoSorterApp:
     def __init__(self, root):
@@ -53,7 +54,9 @@ class PhotoSorterApp:
             '파일 이름 오름차순',
             '파일 이름 내림차순',
             '수정 날짜 오름차순',
-            '수정 날짜 내림차순'
+            '수정 날짜 내림차순',
+            '촬영 날짜 오름차순',    # 추가
+            '촬영 날짜 내림차순'     # 추가
         ]
         self.selected_sort_option = tk.StringVar()
         self.selected_sort_option.set(self.sort_options[0])  # 기본값 설정
@@ -201,6 +204,10 @@ class PhotoSorterApp:
             self.photo_list = sorted(photo_files, key=lambda x: os.path.getmtime(os.path.join(self.source_folder, x)))
         elif sort_option == '수정 날짜 내림차순':
             self.photo_list = sorted(photo_files, key=lambda x: os.path.getmtime(os.path.join(self.source_folder, x)), reverse=True)
+        elif sort_option == '촬영 날짜 오름차순':
+            self.photo_list = sorted(photo_files, key=lambda x: self.get_taken_date_safe(os.path.join(self.source_folder, x)) or datetime.datetime.min)
+        elif sort_option == '촬영 날짜 내림차순':
+            self.photo_list = sorted(photo_files, key=lambda x: self.get_taken_date_safe(os.path.join(self.source_folder, x)) or datetime.datetime.min, reverse=True)
         else:
             self.photo_list = photo_files  # 기본값
 
@@ -210,6 +217,16 @@ class PhotoSorterApp:
             self.display_photo()
         else:
             messagebox.showinfo("사진이 없습니다", "선택한 원본 폴더에 사진이 없습니다.")
+
+    def get_taken_date_safe(self, photo_path):
+        date_str = get_taken_date(photo_path)
+        if date_str:
+            try:
+                # 날짜 문자열을 datetime 객체로 변환
+                return datetime.datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+            except ValueError as e:
+                print(f"날짜 형식 변환 오류 ({photo_path}): {e}")
+        return None
 
     def display_photo(self):
         if self.photo_list and 0 <= self.current_photo_index < len(self.photo_list):
@@ -450,6 +467,11 @@ class PhotoSorterApp:
             func_name, key_label = self.waiting_for_key
             key_sym = event.keysym
 
+            # 숫자 키(1-9)는 분류 기능 전용이므로 단축키로 사용할 수 없음
+            if key_sym in [str(n) for n in range(1, 10)]:
+                messagebox.showwarning("단축키 설정 불가", "숫자 키(1-9)는 분류 기능 전용 키로 사용할 수 없습니다.")
+                return
+
             # 이전에 동일한 키가 다른 기능에 할당되어 있는지 확인
             for fn, key in self.shortcuts.items():
                 if key == key_sym and fn != func_name:
@@ -486,6 +508,24 @@ class PhotoSorterApp:
         func = self.function_map.get(func_name)
         if func:
             func()
+
+def get_taken_date(photo_path):
+    try:
+        img = Image.open(photo_path)
+        exif_data = img._getexif()
+        if exif_data:
+            # EXIF 태그의 키와 이름 매핑 생성
+            exif = {
+                ExifTags.TAGS.get(k, k): v
+                for k, v in exif_data.items()
+            }
+            taken_date = exif.get('DateTimeOriginal')
+            if taken_date:
+                # 날짜 형식을 통일하기 위해 반환
+                return taken_date
+    except Exception as e:
+        print(f"EXIF 데이터 추출 오류 ({photo_path}): {e}")
+    return None
 
 if __name__ == "__main__":
     root = tk.Tk()
