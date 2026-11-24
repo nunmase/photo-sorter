@@ -1,7 +1,8 @@
+import errno
 import os
 import shutil
-import threading
-import queue
+import stat
+from tempfile import TemporaryDirectory
 import tkinter as tk
 from tkinter import filedialog, messagebox, Toplevel
 from PIL import Image, ImageTk, ExifTags
@@ -9,10 +10,44 @@ import json
 import sys
 import datetime
 
+
+def move_without_overwrite(source_path, destination_path):
+    """Move a photo while preserving any file at the destination."""
+    if os.path.lexists(destination_path):
+        raise FileExistsError(f"같은 이름의 파일 또는 폴더가 있습니다.\n{destination_path}")
+
+    # Windows의 같은 드라이브 안에서는 기존 파일을 덮어쓰지 않는 이름 변경을 사용한다.
+    if os.name == 'nt':
+        try:
+            os.rename(source_path, destination_path)
+            return
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+
+    # 복사가 끝난 파일만 최종 이름으로 옮기고, 기존 파일이 생겼으면 중단한다.
+    destination_folder = os.path.dirname(destination_path) or '.'
+    with TemporaryDirectory(dir=destination_folder) as temporary_folder:
+        staged_path = os.path.join(temporary_folder, 'photo')
+        shutil.copy2(source_path, staged_path, follow_symlinks=False)
+        if os.name == 'nt':
+            os.rename(staged_path, destination_path)
+        else:
+            os.link(staged_path, destination_path, follow_symlinks=False)
+
+        try:
+            os.unlink(source_path)
+        except OSError:
+            if os.name == 'nt' and not os.path.islink(destination_path):
+                os.chmod(destination_path, stat.S_IWRITE)
+            os.unlink(destination_path)
+            raise
+
+
 class PhotoSorterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("사진 분류 프로그램")
+        self.root.title("사진 분류 프로그램 1.31")
         self.root.geometry("800x600")  # 창 크기 조정
 
         self.source_folder = ""
@@ -21,10 +56,6 @@ class PhotoSorterApp:
         self.current_photo_index = 0  # 현재 사진 인덱스
 
         self.is_sorting_mode = False
-
-        self.event_queue = queue.Queue()  # 이벤트 큐 생성
-        self.event_thread = threading.Thread(target=self.process_events, daemon=True)
-        self.event_thread.start()
 
         self.resize_job = None  # resize_job 초기화
 
@@ -365,74 +396,62 @@ class PhotoSorterApp:
             self.sort_button.config(bg="SystemButtonFace", text="분류 시작")
 
     def handle_keypress(self, event):
-        if self.is_sorting_mode and event.char.isdigit():
+        if self.is_sorting_mode and event.char.isdecimal():
             folder_number = int(event.char)
             if folder_number in self.destination_folders:
-                # 이벤트 큐에 키 입력 추가
-                self.event_queue.put(folder_number)
-
-    def process_events(self):
-        while True:
-            folder_number = self.event_queue.get()
-            if folder_number is None:
-                break  # 스레드 종료
-            self.move_photo(folder_number)
-            self.event_queue.task_done()
+                self.move_photo(folder_number)
 
     def move_photo(self, folder_number):
+        if self.current_photo_index >= len(self.photo_list):
+            self.is_sorting_mode = False
+            self.update_sort_button()
+            self.display_photo()
+            messagebox.showinfo("사진이 없습니다", "더 이상 분류할 사진이 없습니다.")
+            return
+
+        photo_to_move = self.photo_list[self.current_photo_index]
+        source_path = os.path.join(self.source_folder, photo_to_move)
+        destination_path = os.path.join(self.destination_folders[folder_number], photo_to_move)
+
         try:
-            if self.current_photo_index >= len(self.photo_list):
-                # 더 이상 사진이 없을 경우
-                self.is_sorting_mode = False
-                self.root.after(0, lambda: messagebox.showinfo("사진이 없습니다", "더 이상 분류할 사진이 없습니다."))
-                self.root.after(0, self.update_sort_button)  # 버튼 UI 업데이트
-                self.root.after(0, self.display_photo)
-                return
+            move_without_overwrite(source_path, destination_path)
+        except OSError as error:
+            messagebox.showerror("이동 오류", str(error))
+            return
 
-            photo_to_move = self.photo_list[self.current_photo_index]
-            source_path = os.path.join(self.source_folder, photo_to_move)
-            destination_path = os.path.join(self.destination_folders[folder_number], photo_to_move)
-
-            shutil.move(source_path, destination_path)
-
-            # 이동 기록 저장
-            self.move_history.append((source_path, destination_path, photo_to_move))
-
-            # 이미지 이동 후 photo_list에서 해당 파일 제거
-            del self.photo_list[self.current_photo_index]
-
-            # UI 업데이트는 메인 스레드에서 수행해야 함
-            self.root.after(0, self.display_photo)
-
-            if self.current_photo_index >= len(self.photo_list):
-                self.is_sorting_mode = False
-                self.root.after(0, lambda: messagebox.showinfo("완료", "모든 사진이 분류되었습니다."))
-                self.root.after(0, self.update_sort_button)  # 버튼 UI 업데이트
-                self.root.after(0, self.display_photo)
-        except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("오류", str(e)))
+        self.move_history.append((source_path, destination_path, photo_to_move))
+        del self.photo_list[self.current_photo_index]
+        finished = self.current_photo_index >= len(self.photo_list)
+        if finished:
+            self.is_sorting_mode = False
+            self.update_sort_button()
+        self.display_photo()
+        if finished:
+            messagebox.showinfo("완료", "모든 사진이 분류되었습니다.")
 
     def undo_move(self):
         if not self.move_history:
             messagebox.showinfo("실행 취소 불가", "실행 취소할 작업이 없습니다.")
             return
 
-        # 최근 이동한 파일 정보 가져오기
-        source_path, destination_path, photo_name = self.move_history.pop()
+        source_path, destination_path, photo_name = self.move_history[-1]
 
         try:
-            shutil.move(destination_path, source_path)
-            # photo_list에 사진을 다시 추가하고 인덱스 업데이트
+            move_without_overwrite(destination_path, source_path)
+        except OSError as error:
+            messagebox.showerror("실행 취소 오류", str(error))
+            return
+
+        self.move_history.pop()
+        original_folder = os.path.normcase(os.path.realpath(os.path.dirname(source_path)))
+        current_folder = os.path.normcase(os.path.realpath(self.source_folder))
+        if original_folder == current_folder and photo_name not in self.photo_list:
             self.photo_list.insert(self.current_photo_index, photo_name)
             self.display_photo()
-        except Exception as e:
-            messagebox.showerror("오류", f"실행 취소 중 오류 발생: {e}")
 
     def on_closing(self):
         # 프로그램 종료 시 설정 저장
         self.save_settings()
-        # 프로그램 종료 시 스레드 안전하게 종료
-        self.event_queue.put(None)
         self.root.destroy()
 
     # 단축키 설정 기능 수정
