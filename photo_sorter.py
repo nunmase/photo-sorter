@@ -304,16 +304,33 @@ class PhotoSorterApp:
     def select_specific_destination_folders(self):
         popup = Toplevel(self.root)
         popup.title("분류 폴더 선택")
-        popup.geometry("500x400")  # 가로 크기를 500으로 증가
+        popup.geometry("500x500")  # 높이를 증가시킴
         popup.transient(self.root)
         popup.grab_set()
         popup.focus_set()
         popup.bind("<Escape>", lambda e: popup.destroy())  # ESC 키로 창 닫기
 
+        folder_labels = []  # 폴더 레이블들을 저장할 리스트
+
         for i in range(1, 10):
             folder_label = tk.Label(popup, text=f"분류 폴더 {i}: {self.destination_folders.get(i, '선택되지 않음')}")
             folder_label.grid(row=i-1, column=0, padx=5, pady=5)
+            folder_labels.append(folder_label)  # 레이블 저장
             tk.Button(popup, text=f"폴더 {i} 선택", command=lambda i=i, label=folder_label: self.update_specific_folder(i, label)).grid(row=i-1, column=1, padx=5, pady=5)
+
+        # 분류 폴더 초기화 버튼 추가
+        reset_button = tk.Button(popup, text="분류 폴더 초기화", command=lambda: self.reset_destination_folders(folder_labels))
+        reset_button.grid(row=10, column=0, columnspan=2, padx=5, pady=20)  # 버튼을 아래쪽에 위치시킴
+
+    def reset_destination_folders(self, folder_labels):
+        result = messagebox.askquestion("분류 폴더 초기화", "모든 분류 폴더를 초기화하시겠습니까?", icon='warning')
+        if result == 'yes':
+            self.destination_folders.clear()
+            # 폴더 레이블 업데이트
+            for i, label in enumerate(folder_labels, start=1):
+                label.config(text=f"분류 폴더 {i}: 선택되지 않음")
+            self.update_labels()  # 메인 윈도우의 레이블 업데이트
+            self.save_settings()  # 설정 저장
 
     def update_specific_folder(self, folder_number, folder_label):
         folder = filedialog.askdirectory(title=f"분류 폴더 {folder_number} 선택")
