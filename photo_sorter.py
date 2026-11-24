@@ -27,20 +27,24 @@ class PhotoSorterApp:
 
         self.resize_job = None  # resize_job 초기화
 
+        self.move_history = []  # 이동 기록을 저장할 스택
+
         # 단축키 관련 변수 초기화
         self.shortcuts = {
             'select_source_folder': None,
             'select_all_destination_folders': None,
             'select_specific_destination_folders': None,
             'set_shortcuts': None,
-            'toggle_sorting_mode': None
+            'toggle_sorting_mode': None,
+            'undo_move': None  # 실행 취소 단축키 추가
         }
         self.function_map = {
             'select_source_folder': self.select_source_folder,
             'select_all_destination_folders': self.select_all_destination_folders,
             'select_specific_destination_folders': self.select_specific_destination_folders,
             'set_shortcuts': self.set_shortcuts,
-            'toggle_sorting_mode': self.toggle_sorting_mode
+            'toggle_sorting_mode': self.toggle_sorting_mode,
+            'undo_move': self.undo_move  # 실행 취소 함수 매핑
         }
         self.shortcut_key_labels = {}  # 단축키 레이블 저장
 
@@ -105,7 +109,15 @@ class PhotoSorterApp:
             with open(settings_path, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
                 self.source_folder = settings.get('source_folder', '')
-                self.destination_folders = settings.get('destination_folders', {})
+                # 원본 폴더 존재 여부 확인
+                if not os.path.exists(self.source_folder):
+                    self.source_folder = ''
+
+                # 분류 폴더 로드 시 키를 정수로 변환
+                self.destination_folders = {int(k): v for k, v in settings.get('destination_folders', {}).items()}
+                # 분류 폴더 존재 여부 확인
+                self.destination_folders = {k: v for k, v in self.destination_folders.items() if os.path.exists(v)}
+
                 self.shortcuts = settings.get('shortcuts', {})
                 selected_sort_option = settings.get('selected_sort_option', self.sort_options[0])
                 self.selected_sort_option.set(selected_sort_option)
@@ -130,6 +142,7 @@ class PhotoSorterApp:
         tk.Button(self.button_frame, text="단축키 설정", command=self.set_shortcuts).pack(side=tk.LEFT, padx=5)
         self.sort_button = tk.Button(self.button_frame, text="분류 시작", command=self.toggle_sorting_mode)
         self.sort_button.pack(side=tk.LEFT, padx=5)
+        tk.Button(self.button_frame, text="실행 취소", command=self.undo_move).pack(side=tk.LEFT, padx=5)  # 실행 취소 버튼 추가
 
         # 정렬 옵션 드롭다운 메뉴 추가
         tk.Label(self.button_frame, text="정렬 기준:").pack(side=tk.LEFT, padx=5)
@@ -246,6 +259,7 @@ class PhotoSorterApp:
                     self.photo_image = None
                     messagebox.showerror("오류", "유효한 이미지 파일을 찾을 수 없습니다.")
                     self.is_sorting_mode = False
+                    self.update_sort_button()  # 버튼 UI 업데이트
                     return
                 else:
                     self.display_photo()
@@ -300,14 +314,19 @@ class PhotoSorterApp:
             return
 
         self.is_sorting_mode = not self.is_sorting_mode
+        self.update_sort_button()  # 버튼 UI 업데이트
 
         if self.is_sorting_mode:
-            self.sort_button.config(bg="red", text="분류 중지")
             if self.photo_list:
                 self.display_photo()
             else:
                 messagebox.showinfo("사진이 없습니다", "더 이상 분류할 사진이 없습니다.")
                 self.is_sorting_mode = False
+                self.update_sort_button()  # 버튼 UI 업데이트
+
+    def update_sort_button(self):
+        if self.is_sorting_mode:
+            self.sort_button.config(bg="red", text="분류 중지")
         else:
             self.sort_button.config(bg="SystemButtonFace", text="분류 시작")
 
@@ -332,6 +351,7 @@ class PhotoSorterApp:
                 # 더 이상 사진이 없을 경우
                 self.is_sorting_mode = False
                 self.root.after(0, lambda: messagebox.showinfo("사진이 없습니다", "더 이상 분류할 사진이 없습니다."))
+                self.root.after(0, self.update_sort_button)  # 버튼 UI 업데이트
                 self.root.after(0, self.display_photo)
                 return
 
@@ -340,6 +360,9 @@ class PhotoSorterApp:
             destination_path = os.path.join(self.destination_folders[folder_number], photo_to_move)
 
             shutil.move(source_path, destination_path)
+
+            # 이동 기록 저장
+            self.move_history.append((source_path, destination_path, photo_to_move))
 
             # 이미지 이동 후 photo_list에서 해당 파일 제거
             del self.photo_list[self.current_photo_index]
@@ -350,9 +373,26 @@ class PhotoSorterApp:
             if self.current_photo_index >= len(self.photo_list):
                 self.is_sorting_mode = False
                 self.root.after(0, lambda: messagebox.showinfo("완료", "모든 사진이 분류되었습니다."))
+                self.root.after(0, self.update_sort_button)  # 버튼 UI 업데이트
                 self.root.after(0, self.display_photo)
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("오류", str(e)))
+
+    def undo_move(self):
+        if not self.move_history:
+            messagebox.showinfo("실행 취소 불가", "실행 취소할 작업이 없습니다.")
+            return
+
+        # 최근 이동한 파일 정보 가져오기
+        source_path, destination_path, photo_name = self.move_history.pop()
+
+        try:
+            shutil.move(destination_path, source_path)
+            # photo_list에 사진을 다시 추가하고 인덱스 업데이트
+            self.photo_list.insert(self.current_photo_index, photo_name)
+            self.display_photo()
+        except Exception as e:
+            messagebox.showerror("오류", f"실행 취소 중 오류 발생: {e}")
 
     def on_closing(self):
         # 프로그램 종료 시 설정 저장
@@ -365,7 +405,7 @@ class PhotoSorterApp:
     def set_shortcuts(self):
         popup = Toplevel(self.root)
         popup.title("단축키 설정")
-        popup.geometry("400x300")
+        popup.geometry("400x350")
         popup.transient(self.root)
         popup.grab_set()
         popup.focus_set()
@@ -376,7 +416,8 @@ class PhotoSorterApp:
             ('모든 분류 폴더 선택', 'select_all_destination_folders'),
             ('분류 폴더 선택', 'select_specific_destination_folders'),
             ('단축키 설정', 'set_shortcuts'),
-            ('분류 시작', 'toggle_sorting_mode')
+            ('분류 시작', 'toggle_sorting_mode'),
+            ('실행 취소', 'undo_move')  # 실행 취소 추가
         ]
 
         self.waiting_for_key = None  # 현재 단축키를 기다리는 기능
